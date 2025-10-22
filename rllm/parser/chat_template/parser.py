@@ -65,6 +65,10 @@ class ChatTemplateParser:
             model_name = tokenizer.name_or_path.lower()
             tokenizer_cls = tokenizer.__class__.__name__.lower()
             print(f"model_name: {model_name}, tokenizer_cls: {tokenizer_cls}")
+            # Add Falcon detection
+            if "falcon" in model_name:
+                print(f"Using FalconChatTemplateParser for {tokenizer.name_or_path}")
+                return FalconChatTemplateParser(tokenizer)
             if any(x in model_name for x in ("deepseek", "deepscaler", "deepcoder")) and "llama" in tokenizer_cls:
                 print(f"Using DeepseekQwenChatTemplateParser for {tokenizer.name_or_path}")
                 return DeepseekQwenChatTemplateParser(tokenizer)
@@ -81,6 +85,47 @@ class ChatTemplateParser:
         assert parser.verify_equivalence(PARSER_TEST_MESSAGES), "Parser failed equivalence check"
         return parser
 
+
+class FalconChatTemplateParser(ChatTemplateParser):
+    def __init__(self, tokenizer):
+        super().__init__(tokenizer)
+        self.bos_token = tokenizer.bos_token or ""
+        self.eot_token = "<|im_end|>\n"
+        self.system_token = "<|im_start|>system\n"
+        self.user_token = "<|im_start|>user\n"
+        self.assistant_token = "<|im_start|>assistant\n"
+        self.generation_prompt = self.assistant_token
+
+    def parse(self, messages, add_generation_prompt=False, is_first_msg=False, **kwargs):
+        result = ""
+
+        # Add BOS only on first message
+        if is_first_msg:
+            result += self.bos_token
+
+        for message in messages:
+            if message["role"] == "system":
+                result += self.parse_system(message)
+            elif message["role"] == "user":
+                result += self.parse_user(message)
+            elif message["role"] == "assistant":
+                result += self.parse_assistant(message)
+            else:
+                raise NotImplementedError(f"Unsupported message role: {message['role']}")
+
+        if add_generation_prompt:
+            result += self.generation_prompt
+
+        return result
+
+    def parse_system(self, message):
+        return self.system_token + message["content"] + self.eot_token
+
+    def parse_user(self, message):
+        return self.user_token + message["content"] + self.eot_token
+
+    def parse_assistant(self, message):
+        return self.assistant_token + message["content"] + self.eot_token
 
 class DeepseekQwenChatTemplateParser(ChatTemplateParser):
     def __init__(self, tokenizer):

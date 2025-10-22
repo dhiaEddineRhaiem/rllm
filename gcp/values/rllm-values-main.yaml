@@ -1,0 +1,222 @@
+backend: megatron
+backoffLimit: 0
+components:
+  watchdog:
+    enabled: true
+    gpu_low_power_threshold_minutes: 30
+    gpu_power_threshold_percent: 10
+    image: us-west1-docker.pkg.dev/falcon-training-gpu/tii-aiccu-registry/k8s-tools-workload-watchdog-sidecar:latest
+gpusPerNode: 8
+kueue: true
+nodes: 1
+secrets:
+  WANDB_API_KEY:
+    key: WANDB_API_KEY
+    secret_name: dhia-wandb
+team: falcon-mamba
+topologyAwareScheduling: false
+workload:
+  accelerator_type: nvidia-h100-80gb
+  deadline: "1770966796"
+  experiment: rllm-training
+  extra_env:
+    TII_GCP_JOB_ID: ""
+    TII_RLLM_JOB_NAME: "unnamed-gcp-job"
+    WANDB__SERVICE_WAIT: "300"
+  image: us-west1-docker.pkg.dev/falcon-training-gpu/falcon-mamba/rllm:latest
+  script: |
+    set -ex
+
+    echo "Unzipping code ..."
+    # FIXED: Extract to /workspace (tar contains rllm/* structure)
+    cd /workspace
+    tar -xvf /gcs-code/job-folders/job-${TII_GCP_JOB_ID}/rllm.tar.gz
+    echo "Verifying R2E-Gym extraction..."
+    echo "Contents of /workspace:"
+    ls -la /workspace/
+    echo "Contents of /workspace/rllm:"
+    ls -la /workspace/rllm/
+    echo "Contents of /workspace/rllm/R2E-Gym:"
+
+    # echo "==================================="
+    # echo "Installing verl and rllm packages..."
+    # echo "==================================="
+    # cd /workspace/rllm
+    # uv pip install -e ./verl --system
+    # uv pip install -e . --system
+
+    echo "==================================="
+    echo "Installing R2E-Gym (editable)..."
+    echo "==================================="
+    cd /workspace/rllm/R2E-Gym
+    uv pip install -e . --system
+
+    cd /workspace/rllm
+    # uv pip install -e . --system
+
+    export PYTHONPATH=$PYTHONPATH:/workspace/rllm/R2E-Gym/src
+    echo "PYTHONPATH is now: $PYTHONPATH"
+
+    # echo "Fixing flash-attention for PyTorch 2.8.0+cu128..."
+    # uv pip uninstall flash-attn --system
+    # uv pip install flash-attn --no-build-isolation --system
+
+    # echo "After reinstall:"
+    # python3 -c "import flash_attn; print(f'Flash Attention: {flash_attn.__version__}')"
+    # echo "==================================="
+    # uv pip install --no-build-isolation git+https://github.com/Dao-AILab/causal-conv1d.git@main --system
+    # uv pip install --no-build-isolation git+https://github.com/state-spaces/mamba.git@main --system
+
+    RLLM_DIR=/workspace/rllm
+
+    export NCCL_PROTO="Simple,LL128"
+    export NCCL_DEBUG="INFO"
+    export NCCL_SOCKET_IFNAME="eth0"
+    export PYTHONUNBUFFERED="1"
+    export CUDA_LAUNCH_BLOCKING="1"
+    export NCCL_NET_PLUGIN=none
+    export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+    export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
+    export VLLM_USE_V1=1
+    export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+    export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
+    export TORCHELASTIC_ERROR_FILE=/tmp/error.log
+    export OMP_NUM_THREADS=12
+    export RLLM_DIR=${RLLM_DIR}
+    export JOB_ID=${TII_GCP_JOB_ID}
+    export JOB_NAME=${TII_RLLM_JOB_NAME}
+
+    echo "==================================="
+    echo "RLLM Training Configuration"
+    echo "==================================="
+    echo "Job ID: ${JOB_ID}"
+    echo "Job name: ${JOB_NAME}"
+    echo "RLLM directory: ${RLLM_DIR}"
+    echo "Master address: ${MASTER_ADDR}"
+    echo "==================================="
+
+    cd ${RLLM_DIR}
+
+    python examples/swe/prepare_swe_data.py
+
+    python3 -m rllm.trainer.verl.train_agent_ppo \
+      algorithm.adv_estimator=loop \
+      data.train_files=/workspace/rllm/rllm/data/datasets/R2E_Gym_Subset/train_verl.parquet \
+      data.val_files=/workspace/rllm/rllm/data/datasets/R2E_Gym_Subset/train_verl.parquet \
+      data.train_batch_size=8 \
+      data.val_batch_size=512 \
+      data.max_prompt_length=4096 \
+      data.max_response_length=32768 \
+      data.filter_overlong_prompts=True \
+      data.filter_overlong_prompts_workers=8 \
+      actor_rollout_ref.model.path=tiiuae/Falcon-H1-1.5B-Deep-Instruct \
+      actor_rollout_ref.hybrid_engine=True \
+      actor_rollout_ref.actor.optim.lr=1e-6 \
+      actor_rollout_ref.model.use_remove_padding=True \
+      actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-sum \
+      actor_rollout_ref.actor.ppo_mini_batch_size=8 \
+      actor_rollout_ref.actor.use_dynamic_bsz=False \
+      actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+      actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
+      actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+      actor_rollout_ref.actor.ppo_max_token_len_per_gpu=36864 \
+      actor_rollout_ref.actor.use_kl_loss=False \
+      actor_rollout_ref.actor.clip_ratio_high=0.28 \
+      actor_rollout_ref.actor.kl_loss_coef=0.001 \
+      actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+      actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
+      actor_rollout_ref.model.enable_gradient_checkpointing=True \
+      actor_rollout_ref.actor.fsdp_config.param_offload=True \
+      actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+      actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+      actor_rollout_ref.rollout.name=vllm \
+      actor_rollout_ref.rollout.mode=async \
+      actor_rollout_ref.rollout.chat_scheduler=verl.schedulers.completions_scheduler.CompletionsScheduler \
+      actor_rollout_ref.rollout.enforce_eager=False \
+      actor_rollout_ref.rollout.temperature=1.0 \
+      actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+      actor_rollout_ref.rollout.n=1 \
+      actor_rollout_ref.rollout.val_kwargs.n=1 \
+      actor_rollout_ref.rollout.val_kwargs.temperature=0 \
+      actor_rollout_ref.ref.ulysses_sequence_parallel_size=1 \
+      actor_rollout_ref.ref.fsdp_config.param_offload=True \
+      actor_rollout_ref.actor.entropy_coeff=0.0 \
+      algorithm.kl_ctrl.kl_coef=0.001 \
+      algorithm.mask_truncated_samples=False \
+      algorithm.clip_advantages=False \
+      trainer.critic_warmup=0 \
+      trainer.logger=[console,wandb] \
+      trainer.project_name=deepscaler-agent \
+      trainer.experiment_name="${TII_RLLM_JOB_NAME}" \
+      trainer.val_before_train=False \
+      trainer.n_gpus_per_node=8 \
+      trainer.n_training_gpus_per_node=8 \
+      trainer.nnodes=${NNODES} \
+      trainer.save_freq=2 \
+      trainer.test_freq=10 \
+      trainer.default_hdfs_dir=null \
+      trainer.default_local_dir=/gcs-chkp/rllm-checkpoints/${JOB_ID} \
+      env.name=swe \
+      agent.name=sweagent \
+      agent.max_steps=50 \
+      agent.overlong_filter=True \
+      agent.trajectory_timeout=5400 \
+      agent.async_engine=True \
+      trainer.total_epochs=1000
+
+  spot: false
+  type: training
+  on_demand: "false"
+  volumes:
+    gcsMounts:
+      - bucket: tii-aiccu-falcon-mamba-us-central1
+        mountPath: /gcs
+        name: gcs
+        type: data
+        options:
+          fileCacheMaxSizeMb: 2097152
+        mountOptions:
+          - implicit-dirs
+          - rename-dir-limit=200000
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:-1
+          - metadata-cache:type-cache-max-size-mb:-1
+          - file-cache:max-size-mb:-1
+          - file-cache:cache-file-for-range-read:true
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - file-cache:enable-parallel-downloads:true
+      - bucket: tii-aiccu-checkpoints-us-central1
+        mountPath: /gcs-chkp
+        name: gcs-chkp
+        type: checkpoints
+        options:
+          fileCacheMaxSizeMb: 2097152
+        mountOptions:
+          - implicit-dirs
+          - rename-dir-limit=200000
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:-1
+          - metadata-cache:type-cache-max-size-mb:-1
+          - file-cache:max-size-mb:-1
+          - file-cache:cache-file-for-range-read:true
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - file-cache:enable-parallel-downloads:true
+      - bucket: tii-aiccu-falcon-mamba-us-central1
+        mountPath: /gcs-code
+        name: gcs-code
+        type: checkpoints
+        options:
+          fileCacheMaxSizeMb: 2097152
+        mountOptions:
+          - implicit-dirs
+          - rename-dir-limit=200000
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:-1
+          - metadata-cache:type-cache-max-size-mb:-1
+          - file-cache:max-size-mb:-1
+          - file-cache:cache-file-for-range-read:true
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - file-cache:enable-parallel-downloads:true
+    ssdMountPath: /ssd
+
+    # python gcp/scripts/launch_rllm_job.py   --rllm_code_path /home/aiccu/rllm   --config_yaml_path /home/aiccu/rllm/gcp/configs/qwen3-1b.yaml   --values_yaml_path /home/aiccu/rllm/gcp/values/rllm-values-main.yaml   --charts_path /home/aiccu/aiccu-helm-charts/simple-job/   --gcs_bucket_path gs://tii-aiccu-falcon-mamba-us-central1   --job_name rllm-falconh1-1b-deep   --n_nodes 1   --region us-central1
