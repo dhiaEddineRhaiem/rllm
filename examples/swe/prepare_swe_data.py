@@ -81,8 +81,8 @@ if __name__ == "__main__":
 
     if train_datasets:
         print("Sample train example from first dataset:")
-        print(train_datasets[0].get_data()[0])
+        # print(train_datasets[0].get_data()[0])
 
     if test_datasets:
         print("Sample test example from first dataset:")
-        print(test_datasets[0].get_data()[0])
+        # print(test_datasets[0].get_data()[0])
