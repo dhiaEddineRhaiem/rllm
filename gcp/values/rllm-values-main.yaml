@@ -26,7 +26,7 @@ workload:
   image: us-west1-docker.pkg.dev/falcon-training-gpu/falcon-mamba/rllm:latest
   script: |
     set -ex
-
+    export NNODES=1
     echo "Unzipping code ..."
     # FIXED: Extract to /workspace (tar contains rllm/* structure)
     cd /workspace
@@ -57,15 +57,15 @@ workload:
     export PYTHONPATH=$PYTHONPATH:/workspace/rllm/R2E-Gym/src
     echo "PYTHONPATH is now: $PYTHONPATH"
 
-    # echo "Fixing flash-attention for PyTorch 2.8.0+cu128..."
-    # uv pip uninstall flash-attn --system
-    # uv pip install flash-attn --no-build-isolation --system
+    echo "Fixing flash-attention for PyTorch 2.8.0+cu128..."
+    uv pip uninstall flash-attn --system
+    uv pip install flash-attn --no-build-isolation --system
 
-    # echo "After reinstall:"
-    # python3 -c "import flash_attn; print(f'Flash Attention: {flash_attn.__version__}')"
-    # echo "==================================="
-    # uv pip install --no-build-isolation git+https://github.com/Dao-AILab/causal-conv1d.git@main --system
-    # uv pip install --no-build-isolation git+https://github.com/state-spaces/mamba.git@main --system
+    echo "After reinstall:"
+    python3 -c "import flash_attn; print(f'Flash Attention: {flash_attn.__version__}')"
+    echo "==================================="
+    uv pip install --no-build-isolation git+https://github.com/Dao-AILab/causal-conv1d.git@main --system
+    uv pip install --no-build-isolation git+https://github.com/state-spaces/mamba.git@main --system
 
     RLLM_DIR=/workspace/rllm
 
@@ -89,6 +89,7 @@ workload:
     echo "==================================="
     echo "RLLM Training Configuration"
     echo "==================================="
+    export NNODES=1
     echo "Job ID: ${JOB_ID}"
     echo "Job name: ${JOB_NAME}"
     echo "RLLM directory: ${RLLM_DIR}"
@@ -109,7 +110,7 @@ workload:
       data.max_response_length=32768 \
       data.filter_overlong_prompts=True \
       data.filter_overlong_prompts_workers=8 \
-      actor_rollout_ref.model.path=tiiuae/Falcon-H1-1.5B-Deep-Instruct \
+      actor_rollout_ref.model.path=tiiuae/Falcon-H1-0.5B-Instruct \
       actor_rollout_ref.hybrid_engine=True \
       actor_rollout_ref.actor.optim.lr=1e-6 \
       actor_rollout_ref.model.use_remove_padding=True \
@@ -135,7 +136,7 @@ workload:
       actor_rollout_ref.rollout.enforce_eager=False \
       actor_rollout_ref.rollout.temperature=1.0 \
       actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-      actor_rollout_ref.rollout.n=1 \
+      actor_rollout_ref.rollout.n=2 \
       actor_rollout_ref.rollout.val_kwargs.n=1 \
       actor_rollout_ref.rollout.val_kwargs.temperature=0 \
       actor_rollout_ref.ref.ulysses_sequence_parallel_size=1 \
@@ -219,4 +220,4 @@ workload:
           - file-cache:enable-parallel-downloads:true
     ssdMountPath: /ssd
 
-    # python gcp/scripts/launch_rllm_job.py   --rllm_code_path /home/aiccu/rllm   --config_yaml_path /home/aiccu/rllm/gcp/configs/qwen3-1b.yaml   --values_yaml_path /home/aiccu/rllm/gcp/values/rllm-values-main.yaml   --charts_path /home/aiccu/aiccu-helm-charts/simple-job/   --gcs_bucket_path gs://tii-aiccu-falcon-mamba-us-central1   --job_name rllm-falconh1-1b-deep   --n_nodes 1   --region us-central1
+    # python gcp/scripts/launch_rllm_job.py   --rllm_code_path /Users/dhiaeddinerhaiem/rllm   --config_yaml_path /Users/dhiaeddinerhaiem/rllm/gcp/configs/qwen3-1b.yaml   --values_yaml_path /Users/dhiaeddinerhaiem/rllm/gcp/values/rllm-values-main.yaml   --charts_path /Users/dhiaeddinerhaiem/aiccu-helm-charts/simple-job/   --gcs_bucket_path gs://tii-aiccu-falcon-mamba-us-central1   --job_name rllm-falconh1-1b-deep   --n_nodes 1   --region us-central1

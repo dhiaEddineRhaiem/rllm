@@ -1,36 +1,35 @@
 #!/usr/bin/env python
+import hashlib
 import os
 import subprocess
 import tempfile
-import hashlib
-import shutil
-import yaml
 from pathlib import Path
+
+import yaml
 from fire import Fire
+
 
 def cleanup_debug_jobs(namespace: str, job_prefix: str = "rllm-debug"):
     """Clean up any existing jobs that start with the given prefix"""
     print(f"\n[Pre-deploy] Checking for existing {job_prefix}* jobs to cleanup...")
 
     # List all helm releases in the namespace
-    helm_list_output = run_command(
-        f"helm list --namespace {namespace} --output json",
-        check=False
-    )
+    helm_list_output = run_command(f"helm list --namespace {namespace} --output json", check=False)
 
     if not helm_list_output:
         print(f"  No existing releases found in namespace {namespace}")
         return
 
     import json
+
     try:
         releases = json.loads(helm_list_output)
     except json.JSONDecodeError:
-        print(f"  Could not parse helm list output")
+        print("  Could not parse helm list output")
         return
 
     # Filter releases that start with the prefix
-    matching_releases = [r for r in releases if "rllm" in r['name']]
+    matching_releases = [r for r in releases if "rllm" in r["name"]]
 
     if not matching_releases:
         print(f"  No {job_prefix}* jobs found")
@@ -42,19 +41,17 @@ def cleanup_debug_jobs(namespace: str, job_prefix: str = "rllm-debug"):
 
     # Uninstall each matching release
     for release in matching_releases:
-        release_name = release['name']
+        release_name = release["name"]
         print(f"  Uninstalling {release_name}...")
         try:
-            run_command(
-                f"helm uninstall {release_name} --namespace {namespace}",
-                check=True
-            )
+            run_command(f"helm uninstall {release_name} --namespace {namespace}", check=True)
             print(f"    ✓ Successfully uninstalled {release_name}")
         except subprocess.CalledProcessError as e:
             print(f"    ✗ Failed to uninstall {release_name}: {e}")
             # Continue with other releases even if one fails
 
-    print(f"  Cleanup complete\n")
+    print("  Cleanup complete\n")
+
 
 def run_command(command, check=True):
     """Run a shell command and return its output"""
@@ -87,7 +84,7 @@ def override_values_yaml(
     region: str,
 ):
     """Override values.yaml with runtime parameters"""
-    with open(values_yaml_path, "r") as f:
+    with open(values_yaml_path) as f:
         data = yaml.safe_load(f)
 
     # Set number of nodes
@@ -98,9 +95,7 @@ def override_values_yaml(
 
     # Fix localhost for single node
     if n_nodes == 1:
-        data["workload"]["script"] = data["workload"]["script"].replace(
-            "$MASTER_ADDR", "localhost"
-        )
+        data["workload"]["script"] = data["workload"]["script"].replace("$MASTER_ADDR", "localhost")
 
     # Update checkpoint bucket region if needed
     for mounted_bucket in data["workload"]["volumes"]["gcsMounts"]:
@@ -128,7 +123,6 @@ def main(
     region: str = "us-central1",
     namespace: str = "falcon-mamba",
     cleanup_debug_jobs_first: bool = True,
-
 ):
     """
     Launch RLLM training job on Kubernetes
@@ -158,7 +152,7 @@ def main(
     gcs_config_path = f"{gcs_bucket_path}/job-folders/job-{job_id}/config.yaml"
 
     print("=" * 60)
-    print(f"Launching RLLM Job")
+    print("Launching RLLM Job")
     print("=" * 60)
     print(f"Job ID:       {job_id}")
     print(f"Job Name:     {full_job_name}")
@@ -183,7 +177,7 @@ def main(
 
     # FIXED: Properly exclude .git directories recursively but keep all source code
     print(f"  Creating tar from: {rllm_path}")
-    print(f"  Checking for R2E-Gym directory...")
+    print("  Checking for R2E-Gym directory...")
     r2e_gym_path = rllm_path / "R2E-Gym"
     if r2e_gym_path.exists():
         print(f"  ✓ R2E-Gym found at: {r2e_gym_path}")
@@ -192,21 +186,12 @@ def main(
 
     # Create tar excluding .git recursively and Python cache files
     # Note: Using --exclude pattern matches anywhere in the path
-    tar_cmd = (
-        f"tar "
-        f"--exclude='*/.git' "
-        f"--exclude='*/.git/*' "
-        f"--exclude='*.pyc' "
-        f"--exclude='*/__pycache__' "
-        f"--exclude='*/__pycache__/*' "
-        f"-czf {tmp_tar_path} "
-        f"-C {parent_dir} {dir_name}"
-    )
+    tar_cmd = f"tar --exclude='*/.git' --exclude='*/.git/*' --exclude='*.pyc' --exclude='*/__pycache__' --exclude='*/__pycache__/*' -czf {tmp_tar_path} -C {parent_dir} {dir_name}"
     print(f"  Running: {tar_cmd}")
     run_command(tar_cmd)
 
     # Verify tar contents
-    print(f"  Verifying tar contents...")
+    print("  Verifying tar contents...")
     tar_list = run_command(f"tar -tzf {tmp_tar_path} | head -20")
     print(f"  First 20 entries in tar:\n{tar_list}")
 
@@ -215,8 +200,8 @@ def main(
     if int(r2e_check) > 0:
         print(f"  ✓ R2E-Gym IS included in tar ({r2e_check} entries)")
     else:
-        print(f"  ✗ WARNING: R2E-Gym NOT found in tar!")
-        print(f"  This may cause issues during deployment.")
+        print("  ✗ WARNING: R2E-Gym NOT found in tar!")
+        print("  This may cause issues during deployment.")
 
     # 2. Upload code to GCS
     print(f"[2/6] Uploading code to GCS: {gcs_code_path}")
@@ -229,29 +214,18 @@ def main(
 
     # 4. Override values.yaml
     print("[4/6] Generating values.yaml...")
-    tmp_values_path = override_values_yaml(
-        values_yaml_path,
-        n_nodes,
-        wandb_key_name,
-        region
-    )
+    tmp_values_path = override_values_yaml(values_yaml_path, n_nodes, wandb_key_name, region)
 
     # 5. Check for existing job and uninstall if found
     print(f"[5/6] Checking for existing job: {full_job_name}...")
     helm_list = run_command(f"helm list --namespace {namespace}", check=False)
     if full_job_name in helm_list:
-        print(f"    Found existing job. Uninstalling...")
+        print("    Found existing job. Uninstalling...")
         run_command(f"helm uninstall {full_job_name} --namespace {namespace}")
 
     # 6. Deploy with Helm
-    print(f"[6/6] Deploying job with Helm...")
-    helm_cmd = (
-        f"helm install {full_job_name} {charts_path} "
-        f"-f {tmp_values_path} "
-        f"--namespace {namespace} "
-        f"--set workload.extra_env.TII_GCP_JOB_ID={job_id} "
-        f"--set workload.extra_env.TII_RLLM_JOB_NAME={full_job_name}"
-    )
+    print("[6/6] Deploying job with Helm...")
+    helm_cmd = f"helm install {full_job_name} {charts_path} -f {tmp_values_path} --namespace {namespace} --set workload.extra_env.TII_GCP_JOB_ID={job_id} --set workload.extra_env.TII_RLLM_JOB_NAME={full_job_name}"
     run_command(helm_cmd)
 
     # Cleanup
@@ -262,7 +236,7 @@ def main(
     print("=" * 60)
     print(f"Job Name:     {full_job_name}")
     print(f"Job ID:       {job_id}")
-    print(f"\nMonitor logs with:")
+    print("\nMonitor logs with:")
     print(f"  kubectl logs -f -n {namespace} -l job-name={full_job_name}")
     print("\nVerify R2E-Gym in pod:")
     print(f"  kubectl exec -it -n {namespace} <pod-name> -- ls -la /workspace/rllm/R2E-Gym")
@@ -273,11 +247,11 @@ if __name__ == "__main__":
     Fire(main)
 
 # python launch_rllm_job.py \
-#   --rllm_code_path /home/aiccu/rllm \
-#   --config_yaml_path /home/aiccu/rllm/gcp/configs/qwen3-1b.yaml \
-#   --values_yaml_path /home/aiccu/rllm/gcp/values/rllm-values-main.yaml \
-#   --charts_path /home/aiccu/charts/mambatron \
+#   --rllm_code_path /Users/dhiaeddinerhaiem/rllm \
+#   --config_yaml_path /Users/dhiaeddinerhaiem/rllm/gcp/configs/qwen3-1b.yaml \
+#   --values_yaml_path /Users/dhiaeddinerhaiem/rllm/gcp/values/rllm-values-main.yaml \
+#   --charts_path /Users/dhiaeddinerhaiem/charts/mambatron \
 #   --gcs_bucket_path gs://tii-aiccu-falcon-mamba-us-central1 \
-#   --job_name rllm-debug-qwen1b \
+#   --job_name rllm-debug-falconh1-7b \
 #   --n_nodes 1 \
 #   --region us-central1
