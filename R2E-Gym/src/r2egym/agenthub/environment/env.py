@@ -1,17 +1,17 @@
 # repo_env.py
+import logging
 import os
 import time
-from dataclasses import dataclass, field
-from typing import Dict, Tuple, Any, Optional
+from dataclasses import dataclass
+from typing import Any
 
 import gym
-import logging
 
 from r2egym.agenthub.action import Action
-from r2egym.agenthub.utils.log import get_logger
+from r2egym.agenthub.agent.commands import ParseCommandBash
 from r2egym.agenthub.observation import Observation
 from r2egym.agenthub.runtime.docker import DockerRuntime
-from r2egym.agenthub.agent.commands import ParseCommandBash
+from r2egym.agenthub.utils.log import get_logger
 
 cmd_parser = ParseCommandBash()
 
@@ -20,19 +20,13 @@ cmd_parser = ParseCommandBash()
 class EnvArgs:
     """Configure data sources and setup instructions for the environment in which we solve the tasks."""
 
-    ds: Dict
-    repo_path: Optional[str] = None
-    docker_image: Optional[str] = None
+    ds: dict
+    repo_path: str | None = None
+    docker_image: str | None = None
 
 
 class RepoEnv(gym.Env):
-    def __init__(self,
-                 args: EnvArgs,
-                 logger=None,
-                 backend: str = "docker",
-                 verbose: bool = True,
-                 step_timeout: int = 90,
-                 reward_timeout: int = 300):
+    def __init__(self, args: EnvArgs, logger=None, backend: str = "docker", verbose: bool = True, step_timeout: int = 90, reward_timeout: int = 300):
         # Get the logger
         if logger is None:
             self.logger = get_logger("RepoEnv")  # Pass the module name for clarity
@@ -41,12 +35,10 @@ class RepoEnv(gym.Env):
 
         if not verbose:
             self.logger.setLevel(logging.CRITICAL)  # Disable all possible logging
-            #logging.getLogger().setLevel(logging.CRITICAL)  # Disable root logger
-            #logging.disable(logging.CRITICAL)  # Disable all logging
+            # logging.getLogger().setLevel(logging.CRITICAL)  # Disable root logger
+            # logging.disable(logging.CRITICAL)  # Disable all logging
 
-        self.runtime = DockerRuntime(
-            ds=args.ds, command=["/bin/bash", "-l"], logger=self.logger, backend=backend
-        )
+        self.runtime = DockerRuntime(ds=args.ds, command=["/bin/bash", "-l"], logger=self.logger, backend=backend)
 
         self.args = args
         self.done = False
@@ -56,24 +48,20 @@ class RepoEnv(gym.Env):
         self.backend = backend
         self.step_timeout = step_timeout
         self.reward_timeout = reward_timeout
-        self.logger.info(
-            f"Initialized Env: {self.runtime.repo_name} with image: {self.runtime.docker_image}"
-        )
+        self.logger.info(f"Initialized Env: {self.runtime.repo_name} with image: {self.runtime.docker_image}")
 
-    def reset(self) -> Dict[str, Any]:
+    def reset(self) -> dict[str, Any]:
         """
         Resets the environment and returns an initial observation.
         """
-        self.logger.info(f"Resetting RepoEnv ...")
+        self.logger.info("Resetting RepoEnv ...")
         # close the runtime
         self.runtime.close()
         self.observation = "Environment reset"
         self.state = None
         self.done = False
         # also just recreate env again with the same args
-        self.runtime = DockerRuntime(
-            ds=self.args.ds, command=["/bin/bash", "-l"], logger=self.logger, backend=self.backend
-        )
+        self.runtime = DockerRuntime(ds=self.args.ds, command=["/bin/bash", "-l"], logger=self.logger, backend=self.backend)
         return self.observation  # self.get_observation()
 
     def add_commands(self, cmd_files: list[str]):
@@ -138,7 +126,7 @@ class RepoEnv(gym.Env):
         Returns:
             True if the file starts with a shebang, False otherwise.
         """
-        with open(cmd_file, "r") as file:
+        with open(cmd_file) as file:
             first_line = file.readline().strip()
         return first_line.startswith("#!")
 
@@ -152,9 +140,7 @@ class RepoEnv(gym.Env):
             # Check if action is in allowed actions/commands
             action_name = action.function_name
             allowed_cmds = [x.name for x in self.commands]
-            assert (
-                action_name in allowed_cmds
-            ), f"Invalid Action: input action must be one of allowed actions \n Allowed actions: {allowed_cmds} \n Input action: {action_name}\t"
+            assert action_name in allowed_cmds, f"Invalid Action: input action must be one of allowed actions \n Allowed actions: {allowed_cmds} \n Input action: {action_name}\t"
 
             # Run action and return
             bash_cmd = action.to_bashcmd()
@@ -171,8 +157,10 @@ class RepoEnv(gym.Env):
         return bash_output, error_code, total_time
 
     def step(
-        self, action: Action, timeout: int = None,
-    ) -> Tuple[Observation, int, bool, Dict[str, Any]]:
+        self,
+        action: Action,
+        timeout: int = None,
+    ) -> tuple[Observation, int, bool, dict[str, Any]]:
         """
         Executes an action (command) in the Docker container.
         Runs an action proposed by the agent in the environment and returns the corresponding output.
@@ -203,11 +191,11 @@ class RepoEnv(gym.Env):
         return self.runtime.get_task_instruction()
 
     @property
-    def _observation(self) -> Dict[str, Any]:
+    def _observation(self) -> dict[str, Any]:
         return {"output": self.observation}
 
     @property
-    def _state(self) -> Dict[str, Any]:
+    def _state(self) -> dict[str, Any]:
         return {"state": self.state}
 
     def setup_action_space(self):
@@ -217,7 +205,7 @@ class RepoEnv(gym.Env):
     def add_actions(self, actions: list[dict]) -> None:
         """add different tools from the agent here"""
         pass
-    
+
     def compute_reward(self, timeout: int = None) -> float:
         """
         Compute the reward for the current state.
@@ -238,7 +226,7 @@ class RepoEnv(gym.Env):
     def close(self):
         self.runtime.close()
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """
         Returns the statistics of the environment.
         """

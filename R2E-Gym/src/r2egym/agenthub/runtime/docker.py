@@ -1,72 +1,53 @@
-import os, sys
-import json
-from time import sleep
-import time
-import uuid
-import tempfile
-import docker
-from docker.models.containers import Container
-
-from r2egym.repo_analysis.execution_log_parser import parse_log_fn, decolor_dict_keys
-from r2egym.agenthub.runtime.base import (
-    ExecutionEnvironment,
-)
-import base64
-import subprocess
+import concurrent.futures
 import datetime
 import hashlib
-import shutil
+import io
+import json
+import os
+import re
+import tarfile
+import tempfile
+import time
 import uuid
 
 import docker
 import kubernetes
-import tarfile
-import io
-import os
-from r2egym.agenthub.utils.log import get_logger
-import re
-from r2egym.agenthub.utils.utils import match_dockerimage_to_repo
-from r2egym.agenthub import SUPPORTED_REPOS, SKIP_FILES, SKIP_FILES_NEW, CMD_TIMEOUT
-import concurrent.futures
-
-from r2egym.agenthub.trajectory.swebench_utils import (
-    make_test_spec,
-    swebench_parse,
-    TestSpec,
-)
-from r2egym.agenthub.utils.utils import get_logger
-from r2egym.commit_models.diff_classes import ParsedCommit
-from r2egym.swesmith.utils import get_test_command
-
 from kubernetes import client, config, watch
 
 # For Kubernetes exec.
 from kubernetes.stream import stream
+
+from r2egym.agenthub import CMD_TIMEOUT, SKIP_FILES_NEW
+from r2egym.agenthub.runtime.base import (
+    ExecutionEnvironment,
+)
+from r2egym.agenthub.trajectory.swebench_utils import (
+    TestSpec,
+    make_test_spec,
+)
+from r2egym.agenthub.utils.log import get_logger
+from r2egym.agenthub.utils.utils import get_logger
+from r2egym.commit_models.diff_classes import ParsedCommit
+from r2egym.repo_analysis.execution_log_parser import decolor_dict_keys, parse_log_fn
+from r2egym.swesmith.utils import get_test_command
 
 DEFAULT_NAMESPACE = "falcon-mamba"
 DOCKER_PATH = "/root/.venv/bin:/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 from swebench.harness.constants import (
     APPLY_PATCH_FAIL,
-    END_TEST_OUTPUT,
-    FAIL_TO_FAIL,
     FAIL_TO_PASS,
     KEY_INSTANCE_ID,
-    KEY_PREDICTION,
     MAP_REPO_VERSION_TO_SPECS,
-    PASS_TO_FAIL,
     PASS_TO_PASS,
     RESET_FAILED,
-    START_TEST_OUTPUT,
     TESTS_ERROR,
     TESTS_TIMEOUT,
-    EvalType,
     ResolvedStatus,
-    TestStatus,
 )
-from swebench.harness.test_spec.test_spec import TestSpec
-from swebench.harness.log_parsers import MAP_REPO_TO_PARSER, get_eval_type
 from swebench.harness.grading import get_eval_tests_report, get_resolution_status
+from swebench.harness.log_parsers import MAP_REPO_TO_PARSER, get_eval_type
+from swebench.harness.test_spec.test_spec import TestSpec
 
 
 ##############################################################################
@@ -108,9 +89,9 @@ class DockerRuntime(ExecutionEnvironment):
         self.swebench_verified = "swebench" in self.docker_image
         self.swesmith = "swesmith" in self.docker_image
         if self.swesmith:
-            image_name = self.ds['image_name'].replace('__', '_1776_')
+            image_name = self.ds["image_name"].replace("__", "_1776_")
             self.swebench_verified = False
-            self.docker_image = f'jyangballin/{image_name}:latest'
+            self.docker_image = f"jyangballin/{image_name}:latest"
 
         if self.swebench_verified:
             # also create a test spec for swebench verified dockers (useful for grading)
@@ -120,15 +101,9 @@ class DockerRuntime(ExecutionEnvironment):
         self.repo_path = repo_path
         self.alt_path = alt_path
         self.command = command
-        self.repo_name = (
-            self.ds["repo"] if self.swebench_verified or self.swesmith else self.ds["repo_name"]
-        )
+        self.repo_name = self.ds["repo"] if self.swebench_verified or self.swesmith else self.ds["repo_name"]
         if not self.swesmith:
-            self.commit_json = (
-                self.ds["parsed_commit"]
-                if self.swebench_verified
-                else self.ds["parsed_commit_content"]
-            )
+            self.commit_json = self.ds["parsed_commit"] if self.swebench_verified else self.ds["parsed_commit_content"]
             self.commit = ParsedCommit(**json.loads(self.commit_json))
         self.docker_kwargs = docker_kwargs
         if logger is None:
@@ -159,9 +134,7 @@ class DockerRuntime(ExecutionEnvironment):
             # Generate a random UUID and truncate to 30 characters
             self.container_name = str(uuid.uuid4())
         # print("ckpte self.docker_image ", self.docker_image, "  command : ", command , "   self.container_name: ", self.container_name, "  **docker_kwargs: ", **docker_kwargs)
-        self.start_container(
-            self.docker_image, command, self.container_name, **docker_kwargs
-        )
+        self.start_container(self.docker_image, command, self.container_name, **docker_kwargs)
 
         # Initialize the environment
         self.setup_env()
@@ -175,11 +148,7 @@ class DockerRuntime(ExecutionEnvironment):
             self.logger.info("Container ID: %s", self.container.id)
         elif self.backend == "kubernetes":
             # Assuming self.container is a V1Pod object after creation/retrieval
-            pod_name = (
-                self.container.metadata.name
-                if self.container and self.container.metadata
-                else "N/A"
-            )
+            pod_name = self.container.metadata.name if self.container and self.container.metadata else "N/A"
             self.logger.info("Pod Name: %s", pod_name)
 
     @staticmethod
@@ -193,18 +162,15 @@ class DockerRuntime(ExecutionEnvironment):
         image_name_sanitized = image_name_sanitized.replace(":", "-")
         return f"{image_name_sanitized}-{hash_object.hexdigest()[:10]}"
 
-    def _start_kubernetes_pod(
-        self, docker_image: str, command: str, pod_name: str, **docker_kwargs
-    ):
+    def _start_kubernetes_pod(self, docker_image: str, command: str, pod_name: str, **docker_kwargs):
         """
         Enhanced pod creation with detailed error logging and validation.
         """
+        pod_name = "rllm-pod-" + pod_name
         # Step 1: Check if pod already exists
         self.logger.info(f"🔍 Checking if pod '{pod_name}' already exists in namespace '{DEFAULT_NAMESPACE}'")
         try:
-            self.container = self.client.read_namespaced_pod(
-                name=pod_name, namespace=DEFAULT_NAMESPACE, _request_timeout=60
-            )
+            self.container = self.client.read_namespaced_pod(name=pod_name, namespace=DEFAULT_NAMESPACE, _request_timeout=120)
             self.logger.info(f"✅ Found existing pod: {pod_name} (status: {self.container.status.phase})")
             return
         except client.ApiException as e:
@@ -215,13 +181,10 @@ class DockerRuntime(ExecutionEnvironment):
                 raise
 
         # Step 2: Validate cluster resources BEFORE creating pod
-        self.logger.info(f"🔧 Validating cluster resources for pod creation...")
+        self.logger.info("🔧 Validating cluster resources for pod creation...")
         try:
             # Check if target nodes exist
-            nodes = self.client.list_node(
-                label_selector="sched-instance-type=e2-standard-16",
-                _request_timeout=30
-            )
+            nodes = self.client.list_node(label_selector="sched-instance-type=e2-standard-16", _request_timeout=30)
             if not nodes.items:
                 self.logger.error("❌ CRITICAL: No nodes with label 'sched-instance-type=e2-standard-16' found!")
                 self.logger.error("Available node pools:")
@@ -251,34 +214,32 @@ class DockerRuntime(ExecutionEnvironment):
             "metadata": {
                 "name": pod_name,
                 "namespace": DEFAULT_NAMESPACE,
-                # "labels": {
-                #     "app": "r2e-gym-agent",
-                #     "created-by": "rllm-trainer"
-                # }
+                "labels": {
+                    "app": "r2e-gym-agent",
+                    "created-by": "rllm-trainer",
+                    "managed-by": "rllm",
+                },
             },
             "spec": {
                 "restartPolicy": "Never",
-                "containers": [{
-                    "name": pod_name,
-                    "image": docker_image,
-                    "command": ["/bin/sh", "-c"],
-                    "args": [command] if isinstance(command, str) else command,
-                    "stdin": True,
-                    "tty": True,
-                    "env": env_spec,
-                    "resources": {
-                        "requests": {"cpu": "1", "memory": "1Gi"},
-                        "limits": {"cpu": "2", "memory": "2Gi"}  # Add limits
-                    },
-                    "imagePullPolicy": "IfNotPresent"  # Speed up if cached
-                }],
+                "containers": [
+                    {
+                        "name": pod_name,
+                        "image": docker_image,
+                        "command": ["/bin/sh", "-c"],
+                        "args": [command] if isinstance(command, str) else command,
+                        "stdin": True,
+                        "tty": True,
+                        "env": env_spec,
+                        "resources": {
+                            "requests": {"cpu": "1", "memory": "1Gi"},
+                            "limits": {"cpu": "2", "memory": "2Gi"},  # Add limits
+                        },
+                        "imagePullPolicy": "IfNotPresent",  # Speed up if cached
+                    }
+                ],
                 "nodeSelector": {"sched-instance-type": "e2-standard-16"},
-                "tolerations": [{
-                    "key": "node.kubernetes.io/disk-pressure",
-                    "operator": "Exists",
-                    "effect": "NoExecute",
-                    "tolerationSeconds": 10800
-                }],
+                "tolerations": [{"key": "node.kubernetes.io/disk-pressure", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 10800}],
             },
         }
 
@@ -290,11 +251,7 @@ class DockerRuntime(ExecutionEnvironment):
 
         for attempt in range(1, max_retries + 1):
             try:
-                pod = self.client.create_namespaced_pod(
-                    namespace=DEFAULT_NAMESPACE,
-                    body=pod_body,
-                    _request_timeout=120
-                )
+                pod = self.client.create_namespaced_pod(namespace=DEFAULT_NAMESPACE, body=pod_body, _request_timeout=120)
                 self.logger.info(f"✅ Pod '{pod_name}' created successfully (UID: {pod.metadata.uid})")
                 break
             except client.ApiException as e:
@@ -310,9 +267,7 @@ class DockerRuntime(ExecutionEnvironment):
                 elif e.status == 409:
                     self.logger.warning("   ⚠️ Pod already exists (conflict) - trying to fetch it")
                     try:
-                        pod = self.client.read_namespaced_pod(
-                            name=pod_name, namespace=DEFAULT_NAMESPACE
-                        )
+                        pod = self.client.read_namespaced_pod(name=pod_name, namespace=DEFAULT_NAMESPACE)
                         break
                     except:
                         pass
@@ -325,10 +280,7 @@ class DockerRuntime(ExecutionEnvironment):
                     time.sleep(backoff)
                     backoff *= 2
                 else:
-                    raise RuntimeError(
-                        f"Failed to create pod after {max_retries} attempts. "
-                        f"Last error: {e.status} - {e.reason}. Body: {e.body}"
-                    )
+                    raise RuntimeError(f"Failed to create pod after {max_retries} attempts. Last error: {e.status} - {e.reason}. Body: {e.body}")
             except Exception as e:
                 self.logger.error(f"❌ Unexpected error creating pod: {type(e).__name__}: {e}")
                 raise
@@ -345,7 +297,7 @@ class DockerRuntime(ExecutionEnvironment):
                 namespace=DEFAULT_NAMESPACE,
                 field_selector=f"metadata.name={pod_name}",
                 resource_version=pod.metadata.resource_version,
-                timeout_seconds=300  # Reduce from 1200 to 5 minutes
+                timeout_seconds=300,  # Reduce from 1200 to 5 minutes
             )
 
             start_time = time.time()
@@ -372,15 +324,9 @@ class DockerRuntime(ExecutionEnvironment):
                     w.stop()
                     # Get detailed failure reason
                     try:
-                        pod_detail = self.client.read_namespaced_pod(
-                            name=pod_name, namespace=DEFAULT_NAMESPACE
-                        )
-                        events = self.client.list_namespaced_event(
-                            namespace=DEFAULT_NAMESPACE,
-                            field_selector=f"involvedObject.name={pod_name}",
-                            _request_timeout=30
-                        )
-                        self.logger.error(f"❌ Pod events:")
+                        pod_detail = self.client.read_namespaced_pod(name=pod_name, namespace=DEFAULT_NAMESPACE)
+                        events = self.client.list_namespaced_event(namespace=DEFAULT_NAMESPACE, field_selector=f"involvedObject.name={pod_name}", _request_timeout=30)
+                        self.logger.error("❌ Pod events:")
                         for event in events.items[-5:]:  # Last 5 events
                             self.logger.error(f"   {event.last_timestamp}: {event.reason} - {event.message}")
                     except:
@@ -397,23 +343,18 @@ class DockerRuntime(ExecutionEnvironment):
             self.logger.error(f"❌ Error during pod watch: {e}")
             # Try to get final pod status
             try:
-                final_status = self.client.read_namespaced_pod(
-                    name=pod_name, namespace=DEFAULT_NAMESPACE
-                )
+                final_status = self.client.read_namespaced_pod(name=pod_name, namespace=DEFAULT_NAMESPACE)
                 self.logger.error(f"Final pod phase: {final_status.status.phase}")
             except:
                 pass
             raise
 
-    def start_container(
-        self, docker_image: str, command: str, ctr_name: str, **docker_kwargs
-    ):
+    def start_container(self, docker_image: str, command: str, ctr_name: str, **docker_kwargs):
         # Start or reuse a container
+        prefixed_pod_name = f"rllm-env-{ctr_name}"
         try:
             if self.backend == "docker":
-                containers = self.client.containers.list(
-                    all=True, filters={"name": ctr_name}
-                )
+                containers = self.client.containers.list(all=True, filters={"name": prefixed_pod_name})
                 if containers:
                     self.container = containers[0]
                     if self.container.status != "running":
@@ -422,7 +363,7 @@ class DockerRuntime(ExecutionEnvironment):
                     self.container = self.client.containers.run(
                         docker_image,
                         command,
-                        name=ctr_name,
+                        name=prefixed_pod_name,
                         detach=True,
                         tty=True,
                         stdin_open=True,
@@ -430,12 +371,10 @@ class DockerRuntime(ExecutionEnvironment):
                         **docker_kwargs,
                     )
             elif self.backend == "kubernetes":
-                self._start_kubernetes_pod(
-                    docker_image, command, ctr_name, **docker_kwargs
-                )
+                self._start_kubernetes_pod(docker_image, command, prefixed_pod_name, **docker_kwargs)
         except Exception as e:
             self.logger.error(f"❌ Container start error: {type(e).__name__}: {e}")
-            self.logger.error(f"   Full traceback:", exc_info=True)
+            self.logger.error("   Full traceback:", exc_info=True)
             self.stop_container()
             raise  # ← CRITICAL: Re-raise instead of return!
 
@@ -468,20 +407,13 @@ class DockerRuntime(ExecutionEnvironment):
             if not deletion_confirmed:
                 try:
                     # Check if pod still exists
-                    self.client.read_namespaced_pod(
-                        name=self.container_name, namespace=DEFAULT_NAMESPACE
-                    )
-                    self.logger.warning(
-                        f"Watch timed out but pod {self.container_name} still exists. Forcing deletion."
-                    )
+                    self.client.read_namespaced_pod(name=self.container_name, namespace=DEFAULT_NAMESPACE)
+                    self.logger.warning(f"Watch timed out but pod {self.container_name} still exists. Forcing deletion.")
                     # Try deleting again with force
                     self.client.delete_namespaced_pod(
                         name=self.container_name,
                         namespace=DEFAULT_NAMESPACE,
-                        body=kubernetes.client.V1DeleteOptions(
-                            grace_period_seconds=0,
-                            force=True
-                        ),
+                        body=kubernetes.client.V1DeleteOptions(grace_period_seconds=0, force=True),
                     )
                 except kubernetes.client.rest.ApiException as e:
                     if e.status == 404:
@@ -493,14 +425,10 @@ class DockerRuntime(ExecutionEnvironment):
         except kubernetes.client.rest.ApiException as e:
             if e.status == 404:
                 # Pod already deleted, ignore
-                self.logger.info(
-                    f"Kubernetes pod '{self.container_name}' not found, likely already deleted."
-                )
+                self.logger.info(f"Kubernetes pod '{self.container_name}' not found, likely already deleted.")
             else:
                 # Log other K8s API errors during deletion
-                self.logger.error(
-                    f"Error deleting Kubernetes pod '{self.container_name}': {e}"
-                )
+                self.logger.error(f"Error deleting Kubernetes pod '{self.container_name}': {e}")
                 raise e  # Re-raise unexpected errors
 
     def stop_container(self):
@@ -518,37 +446,35 @@ class DockerRuntime(ExecutionEnvironment):
         f2p_files = list(set([x.split("::", 1)[0] for x in self.ds[FAIL_TO_PASS]]))
         p2p_files = list(set([x.split("::", 1)[0] for x in self.ds[PASS_TO_PASS]]))
         all_files = list(set(f2p_files + p2p_files))
-        all_files = [f for f in all_files if
-             os.path.basename(f).startswith('test_') and os.path.basename(f).endswith('.py') or
-             os.path.basename(f).endswith('_test.py')]
-        commit_id = self.ds['base_commit']
-        reset_command = (
-            f'printf "%s\\n" {" ".join(all_files)} | '
-            f'xargs -n1 -I{{}} git checkout {commit_id} -- "{{}}" 2>/dev/null'
-        )
+        all_files = [f for f in all_files if os.path.basename(f).startswith("test_") and os.path.basename(f).endswith(".py") or os.path.basename(f).endswith("_test.py")]
+        commit_id = self.ds["base_commit"]
+        reset_command = f'printf "%s\\n" {" ".join(all_files)} | xargs -n1 -I{{}} git checkout {commit_id} -- "{{}}" 2>/dev/null'
         self.run(reset_command)
 
     def setup_env_swesmith(self):
         try:
-            commit_id = self.ds['base_commit']
+            commit_id = self.ds["base_commit"]
             self.run("git fetch")
             self.run(f"git checkout {commit_id}")
             # Setup the run_test.sh script for subsequent testing.
             test_command, _ = get_test_command(self.ds)
-            eval_script_content = "\n".join(
-                [
-                    "#!/bin/bash",
-                    "set -uxo pipefail",
-                    "source /opt/miniconda3/bin/activate",
-                    f"conda activate testbed",
-                    f"cd testbed/",
-                    f": '>>>>> Start Test Output'",
-                    test_command,
-                    f": '>>>>> End Test Output'",
-                ]
-            ) + "\n"
+            eval_script_content = (
+                "\n".join(
+                    [
+                        "#!/bin/bash",
+                        "set -uxo pipefail",
+                        "source /opt/miniconda3/bin/activate",
+                        "conda activate testbed",
+                        "cd testbed/",
+                        ": '>>>>> Start Test Output'",
+                        test_command,
+                        ": '>>>>> End Test Output'",
+                    ]
+                )
+                + "\n"
+            )
 
-            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.sh') as temp_file:
+            with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".sh") as temp_file:
                 temp_file.write(eval_script_content)
                 temp_file.flush()  # Ensure content is written to disk
                 temp_file_path = temp_file.name
@@ -560,8 +486,8 @@ class DockerRuntime(ExecutionEnvironment):
             self.run("chmod +x /run_tests.sh")
 
             # Ensure can call and execute the tools in /usr/local/bin.
-            self.run(f"ln -s /opt/miniconda3/envs/testbed /root/.venv")
-            self.run('echo \'export PATH="/usr/local/bin:$PATH"\' >> ~/.bashrc')
+            self.run("ln -s /opt/miniconda3/envs/testbed /root/.venv")
+            self.run("echo 'export PATH=\"/usr/local/bin:$PATH\"' >> ~/.bashrc")
             self.run("python -m pip install chardet")
         except Exception as e:
             self.logger.error(f"Error setting up environment: {repr(e)}")
@@ -574,12 +500,10 @@ class DockerRuntime(ExecutionEnvironment):
             # # move all skip files (if present) to /root
             # for skip_file in SKIP_FILES:
             #     self.run(f"mv {self.repo_path}/{skip_file} {self.alt_path}/{skip_file}")
-            self.alt_path = (
-                "/"  # the run_test is in the "/" directory for swebench dockers
-            )
+            self.alt_path = "/"  # the run_test is in the "/" directory for swebench dockers
 
             # make symlink of conda env to /root/.venv
-            self.run(f"ln -s /opt/miniconda3/envs/testbed /root/.venv")
+            self.run("ln -s /opt/miniconda3/envs/testbed /root/.venv")
 
             # install required packages TODO: check if working
             # self.run(
@@ -590,9 +514,7 @@ class DockerRuntime(ExecutionEnvironment):
             # self.run("apt-get update")
             # self.run("apt-get install -y patchutils")
         except Exception as e:
-            self.logger.error(
-                f"Error setting up environment: {repr(e)} @ {self.docker_image}"
-            )
+            self.logger.error(f"Error setting up environment: {repr(e)} @ {self.docker_image}")
 
     def setup_env(self):
         if self.swebench_verified:
@@ -608,15 +530,9 @@ class DockerRuntime(ExecutionEnvironment):
             # create a symlink from repo_path/.venv to /root/.venv
             self.run(f"ln -s {self.repo_path}/.venv {self.alt_path}/.venv")
 
-            self.run(
-                f"ln -s {self.repo_path}/.venv/bin/python {self.alt_path}/.local/bin/python"
-            )
-            self.run(
-                f"ln -s {self.repo_path}/.venv/bin/python {self.alt_path}/.local/bin/python3"
-            )
-            self.run(
-                f"find {self.repo_path}/.venv/bin -type f -executable -exec ln -sf {{}} {self.alt_path}/.local/bin/ \\;"
-            )
+            self.run(f"ln -s {self.repo_path}/.venv/bin/python {self.alt_path}/.local/bin/python")
+            self.run(f"ln -s {self.repo_path}/.venv/bin/python {self.alt_path}/.local/bin/python3")
+            self.run(f"find {self.repo_path}/.venv/bin -type f -executable -exec ln -sf {{}} {self.alt_path}/.local/bin/ \\;")
             # print(self.run(f"ls -l {self.alt_path}/.local/bin"))
 
             # self.run(f"mv {self.repo_path} /workspace")
@@ -653,7 +569,7 @@ class DockerRuntime(ExecutionEnvironment):
         try:
             content = self.ds["problem_statement"]
             return re.search(r"\[ISSUE\](.*)\[/ISSUE\]", content, re.DOTALL).group(1)
-        except Exception as e:
+        except Exception:
             return self.ds["problem_statement"]
 
     def _run_kubernetes(
@@ -726,9 +642,7 @@ class DockerRuntime(ExecutionEnvironment):
 
             if exit_code != 0:
                 # Log format matches the docker version's error logging
-                self.logger.error(
-                    f"Kubernetes exec Error: Exit code {exit_code}\nError Message: {output}"
-                )
+                self.logger.error(f"Kubernetes exec Error: Exit code {exit_code}\nError Message: {output}")
                 # Return combined output and error code string
                 return output, f"Error: Exit code {exit_code}"
 
@@ -791,9 +705,7 @@ class DockerRuntime(ExecutionEnvironment):
                 return f"The command took too long to execute (>{timeout}s)", "-1"
 
             if error_code != 0:
-                self.logger.error(
-                    f"Error: Exit code {error_code} \nError Message: {output}"
-                )
+                self.logger.error(f"Error: Exit code {error_code} \nError Message: {output}")
                 return output, f"Error: Exit code {error_code}"
 
             # Remove ANSI escape codes and \r characters
@@ -808,9 +720,7 @@ class DockerRuntime(ExecutionEnvironment):
         except Exception as e:
             return f"Error: {repr(e)}", "-1"
 
-    def demux_run(
-        self, code: str, timeout: int = CMD_TIMEOUT, args: str = "", workdir=None
-    ) -> tuple[str, str]:
+    def demux_run(self, code: str, timeout: int = CMD_TIMEOUT, args: str = "", workdir=None) -> tuple[str, str]:
         command = f"timeout {timeout} {code} {args}"
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -829,15 +739,11 @@ class DockerRuntime(ExecutionEnvironment):
             error_code = exec_result.exit_code
 
             # Handle None cases and decode the outputs
-            stdout = (
-                output_data.decode("utf-8", errors="replace") if output_data else ""
-            )
+            stdout = output_data.decode("utf-8", errors="replace") if output_data else ""
             stderr = error_data.decode("utf-8", errors="replace") if error_data else ""
 
             if error_code != 0:
-                self.logger.error(
-                    f"Error: Exit code {error_code} \nStdout Message: {stdout}, \nError Message: {stderr}"
-                )
+                self.logger.error(f"Error: Exit code {error_code} \nStdout Message: {stdout}, \nError Message: {stderr}")
                 return stdout, stderr, f"Error: Exit code {error_code}"
 
             return stdout, stderr, str(error_code)
@@ -879,7 +785,7 @@ class DockerRuntime(ExecutionEnvironment):
                 break  # Success, exit the retry loop
             except Exception as e:
                 if attempt < max_retries - 1:
-                    self.logger.warning(f"Copy to container failed (attempt {attempt+1}/{max_retries}): {str(e)}")
+                    self.logger.warning(f"Copy to container failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
                     time.sleep(retry_delay)
                     retry_delay *= 2  # Exponential backoff
                     retry_delay = min(retry_delay, 60)
@@ -914,9 +820,7 @@ class DockerRuntime(ExecutionEnvironment):
         return output, error_code
 
     def demux_run_tests(self) -> tuple[str, str, str]:
-        stdout, stderr, error_code = self.demux_run(
-            f"bash {self.alt_path}/run_tests.sh"
-        )
+        stdout, stderr, error_code = self.demux_run(f"bash {self.alt_path}/run_tests.sh")
         # Remove ANSI escape codes and \r characters
         stdout = re.sub(r"\x1b\[[0-9;]*m|\r", "", stdout)
         stderr = re.sub(r"\x1b\[[0-9;]*m|\r", "", stderr)
@@ -973,9 +877,7 @@ class DockerRuntime(ExecutionEnvironment):
         output, error_code = self.run(f"git apply -R /{patch_path}")
         return output, error_code
 
-    def get_logs_eval(
-        self, test_spec: TestSpec, content: str
-    ) -> tuple[dict[str, str], bool]:
+    def get_logs_eval(self, test_spec: TestSpec, content: str) -> tuple[dict[str, str], bool]:
         """
         Retrieve evaluation results for a task instance from its corresponding log file
 
@@ -1023,9 +925,7 @@ class DockerRuntime(ExecutionEnvironment):
 
     def parse_logs(self, log_output: str) -> dict:
         if self.swebench_verified:
-            parsed_output, patch_apply_success = self.get_logs_eval(
-                self.test_spec, log_output
-            )
+            parsed_output, patch_apply_success = self.get_logs_eval(self.test_spec, log_output)
             return parsed_output
         else:
             return parse_log_fn(f"{self.repo_name}")(log_output)
@@ -1035,8 +935,8 @@ class DockerRuntime(ExecutionEnvironment):
         output, error_msg = self.run("/run_tests.sh", timeout=timeout)
         parse = self.parse_logs(output)
 
-        fail2pass = [ ".".join(line.split("::")[1:]) for line in self.ds['FAIL_TO_PASS']]
-        pass2pass = [ ".".join(line.split("::")[1:]) for line in self.ds['PASS_TO_PASS']]
+        fail2pass = [".".join(line.split("::")[1:]) for line in self.ds["FAIL_TO_PASS"]]
+        pass2pass = [".".join(line.split("::")[1:]) for line in self.ds["PASS_TO_PASS"]]
         # @(Naman, Jas): Parse the output and return the reward. This implementation is a hack rn.
         if not parse:
             return 0.0
@@ -1048,10 +948,10 @@ class DockerRuntime(ExecutionEnvironment):
                 matching_key = next((k for k in parse.keys() if test_name in k), None)
                 if matching_key is None:
                     return 0.0
-                if parse[matching_key] != 'PASSED':
+                if parse[matching_key] != "PASSED":
                     return 0.0
                 test_name = matching_key
-            if parse[test_name] != 'PASSED':
+            if parse[test_name] != "PASSED":
                 return 0.0
 
         # Check pass2pass
@@ -1062,26 +962,21 @@ class DockerRuntime(ExecutionEnvironment):
                 if matching_key is None:
                     return 0.0
                 test_name = matching_key
-            if parse[test_name] != 'PASSED':
+            if parse[test_name] != "PASSED":
                 return 0.0
         return 1.0
-
 
     def _calculate_reward_swebench(self, get_test_output=False, timeout: int = 300) -> float:
         # gt_test_patch = self.commit.get_patch(test_file=True,non_test_file=False)
         # self.apply_patch(gt_test_patch)
-        out, _ = self.run(
-            "/run_tests.sh", timeout=timeout
-        )  # run the tests after applying the patch
+        out, _ = self.run("/run_tests.sh", timeout=timeout)  # run the tests after applying the patch
         eval_status_map, found = self.get_logs_eval(self.test_spec, out)
         eval_ref = {
             KEY_INSTANCE_ID: self.test_spec.instance_id,
             FAIL_TO_PASS: self.test_spec.FAIL_TO_PASS,
             PASS_TO_PASS: self.test_spec.PASS_TO_PASS,
         }
-        report = get_eval_tests_report(
-            eval_status_map, eval_ref, eval_type=get_eval_type(self.test_spec)
-        )
+        report = get_eval_tests_report(eval_status_map, eval_ref, eval_type=get_eval_type(self.test_spec))
         success = get_resolution_status(report) == ResolvedStatus.FULL.value
         if get_test_output:
             return success, out
@@ -1095,7 +990,7 @@ class DockerRuntime(ExecutionEnvironment):
         parse = decolor_dict_keys(parse)
         try:
             expected_json = self.ds["expected_output_json"]
-        except Exception as e:
+        except Exception:
             expected_json = self.read_file("expected_test_output.json")
 
         expected: dict = json.loads(expected_json)
@@ -1105,6 +1000,7 @@ class DockerRuntime(ExecutionEnvironment):
 
         # Compare
         if len(parse) != len(expected):
+            print("ckpte len unmatched")
             reward = 0.0
         else:
             # If ANY mismatch, reward = 0.0, else = 1.0
@@ -1113,9 +1009,11 @@ class DockerRuntime(ExecutionEnvironment):
                 if not k:
                     continue
                 if k not in expected:
+                    print("ckpte key not in expected")
                     match = False
                     break
                 if parse[k] != expected[k]:
+                    print("ckpte non matched parse vs expected")
                     match = False
                     break
             reward = 1.0 if match else 0.0
@@ -1134,18 +1032,14 @@ class DockerRuntime(ExecutionEnvironment):
 
     def reset(self):
         self.stop_container()
-        self.start_container(
-            self.docker_image, self.command, self.container_name, **self.docker_kwargs
-        )
+        self.start_container(self.docker_image, self.command, self.container_name, **self.docker_kwargs)
 
     def close(self):
         self.stop_container()
         if self.backend == "docker":
             self.client.close()
 
-    def run_swebv_regression(
-        self, run_tests_regression: str | None = None, timeout: int = 300
-    ) -> dict[str, str]:
+    def run_swebv_regression(self, run_tests_regression: str | None = None, timeout: int = 300) -> dict[str, str]:
         # run the regression tests for swebench verified dockers
         # copy the 'run_tests_regression' thing from ds into the container at /run_tests_regression.sh
         if run_tests_regression is None:
@@ -1171,9 +1065,7 @@ class DockerRuntime(ExecutionEnvironment):
         # output, error_code = self.run(f"git checkout -b {branch_name}")
         # # save commit hash
 
-        output, error_code = self.run(
-            "git config --global user.email 'you@example.com'"
-        )
+        output, error_code = self.run("git config --global user.email 'you@example.com'")
         output, error_code = self.run("git config --global user.name 'Your Name'")
         output, error_code = self.run("git rev-parse HEAD")
         self.current_commit = output.strip()

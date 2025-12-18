@@ -87,6 +87,8 @@ class ChatTemplateParser:
 
 
 class FalconChatTemplateParser(ChatTemplateParser):
+    """Parser for Falcon's previous chat template (ChatML-style with tools)."""
+
     def __init__(self, tokenizer):
         super().__init__(tokenizer)
         self.bos_token = tokenizer.bos_token or ""
@@ -94,27 +96,68 @@ class FalconChatTemplateParser(ChatTemplateParser):
         self.system_token = "<|im_start|>system\n"
         self.user_token = "<|im_start|>user\n"
         self.assistant_token = "<|im_start|>assistant\n"
-        self.generation_prompt = self.assistant_token
+        self.generation_prompt = "<|im_start|>assistant"
 
-    def parse(self, messages, add_generation_prompt=False, is_first_msg=False, **kwargs):
+    def parse(self, messages, add_generation_prompt=False, is_first_msg=False, tools=None, **kwargs):
         result = ""
 
-        # Add BOS only on first message
-        if is_first_msg:
-            result += self.bos_token
+        # Add BOS token
+        result += self.bos_token
 
-        for message in messages:
+        # Handle tools
+        if tools:
+            result += self.format_tools_section(messages, tools)
+            # Skip system message if already included in tools section
+            remaining_messages = messages[1:] if messages and messages[0]["role"] == "system" else messages
+        else:
+            # No tools: process system message normally
+            if messages and messages[0]["role"] == "system":
+                result += self.parse_system(messages[0])
+                remaining_messages = messages[1:]
+            else:
+                remaining_messages = messages
+
+        # Parse remaining messages
+        for message in remaining_messages:
             if message["role"] == "system":
-                result += self.parse_system(message)
+                continue  # Already handled
             elif message["role"] == "user":
                 result += self.parse_user(message)
             elif message["role"] == "assistant":
                 result += self.parse_assistant(message)
+            elif message["role"] == "tool":
+                result += self.parse_tool(message)
             else:
                 raise NotImplementedError(f"Unsupported message role: {message['role']}")
 
         if add_generation_prompt:
             result += self.generation_prompt
+
+        return result
+
+    def format_tools_section(self, messages, tools):
+        """Format tools section according to previous Falcon template."""
+        import json
+
+        result = self.system_token
+
+        # Include system message content if present
+        if messages and messages[0]["role"] == "system":
+            result += messages[0]["content"] + "\n\n"
+
+        # Add tools instructions
+        result += "You are a function calling AI model. You are provided with function signature within <tools> </tools> XML tags. "
+        result += "You may call one or more functions to assist with the user query. Don't make assumptions about what values to plug into functions.\n"
+        result += "<tools>\n"
+
+        for tool in tools:
+            result += "[" + json.dumps(tool) + "]"
+
+        result += "\n</tools>\n"
+        result += "For each function call, return a json object with function name and arguments within <tool_call> </tool_call> tags with the following schema:\n"
+        result += "<tool_call>\n"
+        result += "{'arguments': <args-dict>, 'name': <function-name>}\n"
+        result += "</tool_call>\n"
 
         return result
 
@@ -126,6 +169,142 @@ class FalconChatTemplateParser(ChatTemplateParser):
 
     def parse_assistant(self, message):
         return self.assistant_token + message["content"] + self.eot_token
+
+    def parse_tool(self, message):
+        # Tool responses as user messages in previous template
+        return self.user_token + message["content"] + self.eot_token
+
+
+class FalconChatTemplateParserV1(ChatTemplateParser):
+    def __init__(self, tokenizer):
+        super().__init__(tokenizer)
+        self.bos_token = tokenizer.bos_token or ""
+        self.eos_token = tokenizer.eos_token or "<|endoftext|>"
+        self.system_token = "<|system|>\n"
+        self.user_token = "<|user|>\n"
+        self.assistant_token = "<|assistant|>\n"
+        self.generation_prompt = self.assistant_token
+
+        # Tool call tokens
+        self.tool_call_start = "<tool_call>\n"
+        self.tool_call_end = "\n</tool_call>\n"
+        self.tool_response_start = "<tool_response>\n"
+        self.tool_response_end = "\n</tool_response>"
+
+    def parse(self, messages, add_generation_prompt=False, is_first_msg=False, tools=None, **kwargs):
+        result = ""
+
+        # Handle system message
+        if messages and messages[0]["role"] == "system":
+            result += self.parse_system(messages[0])
+            remaining_messages = messages[1:]
+        else:
+            # Default system prompt if none provided
+            result += self.system_token + "You are Falcon, created by Technology Innovation Institute (TII). You are a helpful assistant.\n"
+            remaining_messages = messages
+
+        # Add tools section if provided
+        if tools:
+            result += self.format_tools(tools)
+
+        # Parse remaining messages
+        for idx, message in enumerate(remaining_messages):
+            is_last = idx == len(remaining_messages) - 1
+
+            if message["role"] == "user":
+                result += self.parse_user(message)
+            elif message["role"] == "assistant":
+                result += self.parse_assistant(message, tools=tools, is_last=is_last)
+            elif message["role"] == "tool":
+                result += self.parse_tool(message, remaining_messages, idx)
+            else:
+                raise NotImplementedError(f"Unsupported message role: {message['role']}")
+
+        if add_generation_prompt:
+            result += self.generation_prompt
+
+        return result
+
+    def format_tools(self, tools):
+        """Format tools section according to Falcon template."""
+        import json
+
+        result = "# Tools\n"
+        result += "You may call one or more functions to assist with the user query.\n"
+        result += "You are provided with function signatures within <tools></tools> XML tags.\n"
+        result += "<tools>\n"
+
+        for tool in tools:
+            result += json.dumps(tool) + "\n"
+
+        result += "</tools>\n"
+        result += "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
+        result += "<tool_call>\n"
+        result += '{"name": <function-name>, "arguments": <args-json-object>}\n'
+        result += "</tool_call>\n"
+
+        return result
+
+    def parse_system(self, message):
+        return self.system_token + message["content"] + "\n"
+
+    def parse_user(self, message):
+        return self.user_token + message["content"] + "\n"
+
+    def parse_assistant(self, message, tools=None, is_last=False):
+        import json
+
+        result = self.assistant_token
+
+        # Add content if present
+        if message.get("content"):
+            result += message["content"] + "\n"
+
+        # Add tool calls if present
+        if tools and message.get("tool_calls"):
+            for tool_call in message["tool_calls"]:
+                # Handle both formats: direct tool_call or tool_call.function
+                if hasattr(tool_call, "function"):
+                    tool_call = tool_call.function
+                elif isinstance(tool_call, dict) and "function" in tool_call:
+                    tool_call = tool_call["function"]
+
+                result += self.tool_call_start
+                result += '{"name": "' + tool_call["name"] + '", "arguments":'
+
+                # Handle arguments as string or dict
+                if isinstance(tool_call["arguments"], str):
+                    result += tool_call["arguments"]
+                else:
+                    result += json.dumps(tool_call["arguments"])
+
+                result += "}\n"
+                result += self.tool_call_end
+
+        # Add EOS token if not last message
+        if not is_last:
+            result += self.eos_token + "\n"
+        else:
+            result += self.eos_token
+
+        return result
+
+    def parse_tool(self, message, remaining_messages, idx):
+        """Parse tool response message."""
+        result = ""
+
+        # Check if this is the first tool message in a sequence
+        if idx == 0 or remaining_messages[idx - 1]["role"] != "tool":
+            result += self.user_token
+
+        result += "\n" + self.tool_response_start + message["content"] + self.tool_response_end
+
+        # Check if this is the last tool message in a sequence
+        if idx == len(remaining_messages) - 1 or remaining_messages[idx + 1]["role"] != "tool":
+            result += "\n"
+
+        return result
+
 
 class DeepseekQwenChatTemplateParser(ChatTemplateParser):
     def __init__(self, tokenizer):
